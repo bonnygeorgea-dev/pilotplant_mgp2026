@@ -955,7 +955,7 @@
       <div class="form-group" style="margin-bottom:12px">
         <label>Google Apps Script Web App URL</label>
         <div class="gs-url-row">
-          <input class="gs-url-input" type="url" id="gsUrl" placeholder="https://script.google.com/macros/s/xxxxx/exec" value="https://script.google.com/macros/s/AKfycbzFk4Bm5dQvaqBZBr5Zj4BBTgjQlw6owsm3qixAYkEeMSrFNgw0ZgNM3eBiePqhrQn_bQ/exec">
+          <input class="gs-url-input" type="url" id="gsUrl" placeholder="https://script.google.com/macros/s/xxxxx/exec" value="https://script.google.com/macros/s/AKfycbwM1jO4MyJ0b4k-QTiPPdAAqKLIpzRhIBT0UapxhoU8fJ5jRoaTfvi1iNgEtHzg-VjX/exec">
           <button class="btn btn-blue" onclick="connectSheets()">Connect &amp; Test</button>
           <button class="btn btn-secondary" onclick="disconnectSheets()">Disconnect</button>
         </div>
@@ -1134,12 +1134,14 @@ function init() {
   updateStats();
   setDefaultDates();
   document.getElementById('appsScriptCode').textContent = getAppsScript();
-  const DEFAULT_GS_URL = 'https://script.google.com/macros/s/AKfycbzFk4Bm5dQvaqBZBr5Zj4BBTgjQlw6owsm3qixAYkEeMSrFNgw0ZgNM3eBiePqhrQn_bQ/exec';
-  // Always use the latest hardcoded URL — overwrite any stale URL in localStorage
-  gsUrl = DEFAULT_GS_URL;
-  localStorage.setItem('cumi_gs_url', DEFAULT_GS_URL);
-  document.getElementById('gsUrl').value = DEFAULT_GS_URL;
-  setGsStatus(true);
+  const DEFAULT_GS_URL = 'https://script.google.com/macros/s/AKfycbwM1jO4MyJ0b4k-QTiPPdAAqKLIpzRhIBT0UapxhoU8fJ5jRoaTfvi1iNgEtHzg-VjX/exec';
+  const savedUrl = localStorage.getItem('cumi_gs_url');
+  // Migrate the obsolete bundled endpoint once; preserve later user choices.
+  gsUrl = !savedUrl || savedUrl === 'https://script.google.com/macros/s/AKfycbzFk4Bm5dQvaqBZBr5Zj4BBTgjQlw6owsm3qixAYkEeMSrFNgw0ZgNM3eBiePqhrQn_bQ/exec' ? DEFAULT_GS_URL : savedUrl;
+  if (savedUrl !== gsUrl) invalidateSyncBaseline();
+  localStorage.setItem('cumi_gs_url', gsUrl);
+  document.getElementById('gsUrl').value = gsUrl;
+  setGsStatus(false); // Connected is shown only after a verified handshake.
 }
 
 function loadLocal() {
@@ -1599,24 +1601,42 @@ function setGsStatus(connected) {
   txt.textContent = connected ? 'Google Sheets: Connected' : 'Google Sheets: Not connected';
 }
 
+function invalidateSyncBaseline() {
+  hasSyncedBaseline = false;
+  baseRevision = 0;
+  localStorage.removeItem('cumi_has_synced_baseline');
+  localStorage.removeItem('cumi_base_revision');
+}
+
+function requireCurrentBackend(data) {
+  if (!data || data.status !== 'ok') throw new Error(data?.error || 'Backend did not return status ok');
+  if (String(data.backendVersion || '') !== '4.0') {
+    throw new Error(`Backend version received: ${data.backendVersion || 'missing (legacy backend)'}. Expected 4.0. Check the Web App URL and deployed version.`);
+  }
+  if (!Number.isSafeInteger(data.revision) || data.revision < 0) throw new Error('Backend returned an invalid sync revision');
+  return data;
+}
+
+function backendReadUrl(url, action) {
+  const target = new URL(url);
+  target.searchParams.set('action', action);
+  target.searchParams.set('_', String(Date.now()));
+  return target.toString();
+}
+
 async function connectSheets() {
   const url = document.getElementById('gsUrl').value.trim();
   if (!url) { toast('Enter the Apps Script URL', 'error'); return; }
+  if (url !== gsUrl) invalidateSyncBaseline();
   gsUrl = url;
   localStorage.setItem('cumi_gs_url', url);
+  setGsStatus(false);
   try {
-    // Use a simple GET request — Apps Script handles GET CORS automatically
-    const res = await fetch(`${url}?action=ping`);
-    if (res.ok) {
-      const data = await res.json();
-      if (data.status === 'ok' && String(data.backendVersion||'') === '4.0') {
-        setGsStatus(true);
-        toast('✓ Connected to Google Sheets — backend v4.0', 'success');
-        return;
-      }
-      if (data.status === 'ok') throw new Error('Old Apps Script backend detected — deploy the v4.0 script first');
-    }
-    throw new Error('No response');
+    const res = await fetch(backendReadUrl(url, 'ping'), {cache:'no-store'});
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    requireCurrentBackend(await res.json());
+    setGsStatus(true);
+    toast('✓ Connected to Google Sheets — backend v4.0', 'success');
   } catch(e) {
     toast('Connection failed: ' + e.message, 'error');
     setGsStatus(false);
@@ -1624,6 +1644,7 @@ async function connectSheets() {
 }
 
 function disconnectSheets() {
+  invalidateSyncBaseline();
   gsUrl = '';
   localStorage.removeItem('cumi_gs_url');
   document.getElementById('gsUrl').value = '';
@@ -1649,9 +1670,9 @@ function repairDateValues() {
 }
 
 async function getRemoteSyncState() {
-  const res = await fetch(`${gsUrl}?action=getSyncState&_=${Date.now()}`, {cache:'no-store'});
+  const res = await fetch(backendReadUrl(gsUrl, 'getSyncState'), {cache:'no-store'});
   if (!res.ok) throw new Error('Could not read server sync state');
-  return await res.json();
+  return requireCurrentBackend(await res.json());
 }
 
 async function syncFromSheets(showMsg) {
@@ -1662,11 +1683,11 @@ async function syncFromSheets(showMsg) {
   setSyncLog('⟳ Pulling…');
   safeSetDot('#f59e0b');
   try {
-    const res = await fetch(`${gsUrl}?action=getSnapshot&_=${Date.now()}`, {cache:'no-store'});
+    const res = await fetch(backendReadUrl(gsUrl, 'getSnapshot'), {cache:'no-store'});
     if (!res.ok) throw new Error('Server did not return the shared data');
     const data = await res.json();
-    if (data.error) throw new Error(data.error);
-    if (String(data.backendVersion||'') !== '4.0') throw new Error('Old Apps Script backend detected. Deploy the final v4.0 Apps Script before Pulling.');
+    requireCurrentBackend(data);
+    if (!['inventory','saleLog','txLog','materialBalance'].every(key => Array.isArray(data[key]))) throw new Error('Backend returned an incomplete snapshot');
 
     inventory = (data.inventory || []).map(r => ({
       id: Number(r.id) || nextId++, mat: r.mat || '', grit: fixSheetDateText(r.grit),
